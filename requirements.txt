@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+rapidfuzz
+openpyxl
+xlrd
+python-dateutil
+pytz
+XlsxWriter
+Jinja2
+setuptools
