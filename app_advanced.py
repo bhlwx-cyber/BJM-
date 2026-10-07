@@ -397,6 +397,10 @@ def normalize_customer_key(name):
     text = re.sub(r'\s+(TBK|Tbk|LTD|INC|CORP)\.?\s*$', '', text)
     # Hapus spasi berlebih
     text = re.sub(r'\s+', ' ', text).strip()
+    # FORMAT_6: buang trailing ' -' dan tanda baca berlebih di akhir
+    text = re.sub(r'[\s\-\.,;]+$', '', text).strip()
+    text = re.sub(r'[.,;:\'\"]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def extract_invoice_numbers_legacy(text):
@@ -518,6 +522,8 @@ def extract_invoice_numbers(text, format_type='FORMAT_5'):
         # Buang token pecahan yang diawali "/" atau "-" (mis. "/2024/001")
         if inv.startswith('/') or inv.startswith('-'):
             continue
+        if not any(ch.isdigit() for ch in inv) and not inv.upper().startswith(("M-AR", "MAR", "INV", "PELNS", "PELSN")):
+            continue
         filtered.append(inv)
     
     # Bersihkan duplikat dan kembalikan
@@ -567,7 +573,7 @@ def extract_period_from_tanggal(tanggal):
     return None
 
 # ==============================================
-# 🔹 B2/B3 HELPERS: MODE BARIS FORMAT_5 + NOMINAL UM
+# B2/B3 HELPERS: MODE BARIS FORMAT_5 + NOMINAL UM
 # ==============================================
 def is_apply_empty(val):
     """APPLY kosong: NaN, string kosong, atau hanya spasi."""
@@ -614,6 +620,93 @@ def filter_format5_mode(df, mode):
         mask = pd.Series(True, index=df.index)
     return df[mask].reset_index(drop=True), df[~mask].reset_index(drop=True)
 
+# ==============================================
+# FORMAT_6 (Oracle Receipts) helpers - additive, no change to FORMAT_1-5
+# ==============================================
+def _norm_cols(cols):
+    return [str(c).strip().lower() for c in cols]
+
+def is_format6_signature(cols):
+    n = _norm_cols(cols)
+    has_unapplied = 'unapplied amount' in n
+    has_unidentified_or_ou = ('unidentified amount' in n) or ('operating unit' in n)
+    has_receipt_amount = 'receipt amount' in n
+    has_customer = 'customer name' in n
+    has_receipt_no = 'receipt number' in n
+    return bool(has_unapplied and has_unidentified_or_ou and has_receipt_amount and has_customer and has_receipt_no)
+
+def find_format6_header_row(file, sheet, nrows=None):
+    # cari-header otomatis baris 0-9 untuk FORMAT_6 saja
+    import pandas as _pd
+    for hr in range(0, 10):
+        try:
+            d = _pd.read_excel(file, sheet_name=sheet, header=hr, nrows=nrows)
+            d.columns = d.columns.astype(str).str.strip()
+            cols = [c for c in d.columns if not str(c).startswith('Unnamed')]
+            if is_format6_signature(cols):
+                return hr
+        except Exception:
+            continue
+    return None
+
+def detect_format_fast(file):
+    """Deteksi format cepat saat upload (hanya baca header, tanpa proses data).
+    Memakai fungsi signature yang sama; jika gagal return None tanpa raise."""
+    try:
+        xl = pd.ExcelFile(file)
+        sheet_names = xl.sheet_names
+        # FORMAT_5: sheet ALLPHP (case-insensitive, strip)
+        for sheet in sheet_names:
+            if str(sheet).strip().upper() == 'ALLPHP':
+                return 'FORMAT_5'
+        # FORMAT_5: signature kolom (nrows kecil)
+        for sheet in sheet_names:
+            try:
+                df_test = pd.read_excel(file, sheet_name=sheet, nrows=1)
+                df_test.columns = df_test.columns.astype(str).str.strip()
+                required = ['NO. BUKTI', 'NAMA', 'DEBET (Rp)', 'COMMANDS']
+                matches = sum(1 for col in required if col in df_test.columns)
+                if matches >= 3:
+                    return 'FORMAT_5'
+            except Exception:
+                continue
+        # FORMAT_6: signature (nrows kecil via find_format6_header_row)
+        for sheet in sheet_names:
+            try:
+                hr = find_format6_header_row(file, sheet, nrows=5)
+                if hr is not None:
+                    return 'FORMAT_6'
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+def is_reversal_row_f6(row):
+    st_ = str(row.get('State', '') or '')
+    su_ = str(row.get('Status', '') or '')
+    return ('reversal' in st_.lower()) or (su_.strip().lower() == 'reversed')
+
+def filter_format6_mode(df, mode):
+    # reversal SELALU dikecualikan
+    rev = df.apply(is_reversal_row_f6, axis=1)
+    if mode == 'belum':
+        inc_mask = (df['Unapplied Parsed'] > 0) & (~rev)
+    else:  # 'semua_kecuali_reversal': State in Applied/Unapplied
+        sm = df['State'].astype(str).str.strip().str.lower()
+        inc_mask = sm.isin(['applied', 'unapplied']) & (~rev)
+    inc = df[inc_mask].reset_index(drop=True)
+    exc = df[~inc_mask].reset_index(drop=True)
+    reasons = []
+    for _, r in exc.iterrows():
+        if is_reversal_row_f6(r):
+            reasons.append('reversal')
+        else:
+            reasons.append('applied_nol' if str(r.get('State','')).strip().lower()=='applied' else 'lainnya')
+    exc = exc.copy()
+    exc['Alasan Dikecualikan'] = reasons
+    return inc, exc
+
 def load_bank_data(file):
     """Load dan validasi file Bank Statement DENGAN AUDIT CHECKPOINT + FORMAT DETECTION"""
     # ==============================================
@@ -648,9 +741,28 @@ def load_bank_data(file):
             except Exception:
                 continue
 
-    if format5_sheet is not None:
+    # FORMAT_6: cari sheet pertama cocok signature (evaluasi SEBELUM FORMAT_3/4)
+    _f6_sheet = None
+    _f6_header = 0
+    for _sh in sheet_names:
+        try:
+            _hr = find_format6_header_row(file, _sh)
+            if _hr is not None:
+                _f6_sheet = _sh
+                _f6_header = _hr
+                st.success(f"✅ Sheet FORMAT_6 (Oracle Receipts) ditemukan: '{_sh}' (header baris {_hr+1})")
+                break
+        except Exception:
+            continue
+    if _f6_sheet is not None:
+        df = pd.read_excel(file, sheet_name=_f6_sheet, header=_f6_header)
+        st.info(f"📊 1. LOAD ASLI: {len(df)} BARIS TOTAL (sheet '{_f6_sheet}')")
+        df.attrs['format6_sheet'] = _f6_sheet
+        df.attrs['format6_header'] = _f6_header
+    elif format5_sheet is not None:
         # Load dari sheet yang cocok dengan FORMAT_5
-        df = pd.read_excel(file, sheet_name=format5_sheet)
+        import pandas as _pd2
+        df = _pd2.read_excel(file, sheet_name=format5_sheet)
         st.info(f"📊 1. LOAD ASLI: {len(df)} BARIS TOTAL (sheet '{format5_sheet}')")
     else:
         # B1-3: Tidak ada sheet FORMAT_5: pakai alur lama (sheet pertama, FORMAT_1-4)
@@ -659,7 +771,54 @@ def load_bank_data(file):
         st.info(f"📊 1. LOAD ASLI: {len(df)} BARIS TOTAL")
 
     # Bersihkan nama kolom dari spasi berlebih
-    df.columns = df.columns.str.strip()
+    df.columns = df.columns.astype(str).str.strip()
+    # Buang kolom sampah '[ ]' dan 'Unnamed:*' (FORMAT_6)
+    df = df.loc[:, ~df.columns.str.match(r'(?i)^unnamed')]
+    if '[ ]' in df.columns:
+        df = df.drop(columns=['[ ]'])
+    # FORMAT_6 early: jika signature cocok -> mapping langsung, SEBELUM FORMAT_3/4
+    _f6_early = is_format6_signature(list(df.columns))
+    if _f6_early:
+        _map6 = {'Receipt Date': 'Value Date', 'Receipt Number': 'Reference No.', 'Receipt Amount': 'Credit', 'Customer Name': 'Customer_raw'}
+        for _k, _v in _map6.items():
+            for _c in list(df.columns):
+                if str(_c).strip().lower() == str(_k).strip().lower():
+                    if _v not in df.columns:
+                        df = df.rename(columns={_c: _v})
+                    break
+        for _c in ['State', 'Status', 'Receipt Method', 'Unapplied Amount', 'Unidentified Amount', 'Operating Unit', 'Currency']:
+            if _c not in df.columns:
+                _found = None
+                for _cc in list(df.columns):
+                    if str(_cc).strip().lower() == _c.strip().lower():
+                        _found = _cc
+                        break
+                if _found is not None and _found != _c:
+                    df = df.rename(columns={_found: _c})
+                elif _found is None:
+                    df[_c] = ''
+        df['Customer'] = df.get('Customer_raw', '')
+        df['Description'] = (df.get('Receipt Method', '').astype(str) + ' | ' + df.get('State', '').astype(str)).str.strip()
+        df['Value Date'] = pd.to_datetime(df.get('Value Date'), errors='coerce')
+        df['Credit'] = df.get('Credit', 0).apply(parse_universal_amount)
+        df['Unapplied Parsed'] = df.get('Unapplied Amount', 0).apply(parse_universal_amount)
+        df['Unidentified Parsed'] = df.get('Unidentified Amount', 0).apply(parse_universal_amount)
+        df['Nominal Dipakai'] = df.apply(lambda r: float(r.get('Unapplied Parsed', 0) or 0) if float(r.get('Unapplied Parsed', 0) or 0) > 0 else float(r.get('Credit', 0) or 0), axis=1)
+        df['Periode'] = df['Value Date'].apply(extract_period_from_tanggal)
+        df['Periode Source'] = 'Receipt Date'
+        df['Periode Note'] = ''
+        df['Customer_normalized'] = df['Customer'].apply(normalize_customer_key)
+        df.attrs['format_type'] = 'FORMAT_6'
+        df.attrs['strategy'] = 'CUSTOMER_FIRST'
+        st.success('✅ Format terdeteksi: Oracle Receipts (FORMAT_6)')
+        st.info(f"📊 2. SETELAH CEK KOLOM: {len(df)} BARIS")
+        st.info(f"📊 3. SETELAH KONVERSI CREDIT: {len(df[df['Credit'] > 0])} BARIS DENGAN NILAI")
+        st.info(f"📊 4. SEBELUM FILTER: {len(df)} BARIS")
+        df = df[df['Credit'] > 0].reset_index(drop=True)
+        st.success(f"📊 5. SELESAI LOAD: {len(df)} BARIS SIAP DIPROSES")
+        df['bank_id'] = df.index
+        return df
+
 
     # ==============================================
     # 🔹 FORMAT DETECTION ENGINE - ADAPTIVE MULTI-FORMAT
@@ -1040,7 +1199,6 @@ def load_bank_data(file):
                 df['Is UM'] = False
 
             # 9. ✅ B3: NOMINAL PENCOCOKAN MODE UM (SISA UM jika >0, else DEBET)
-            #    APPLY disalin apa adanya (kosong tetap kosong).
             if 'SISA UM (Rp)' in df.columns:
                 df['SISA UM Parsed'] = df['SISA UM (Rp)'].apply(parse_universal_amount)
             else:
@@ -1048,8 +1206,6 @@ def load_bank_data(file):
                 df['SISA UM Parsed'] = 0.0
             if 'APPLY' not in df.columns:
                 df['APPLY'] = ''
-            # Nominal Dipakai dihitung setelah Credit (DEBET) dikonversi di bawah,
-            # tapi simpan SISA parsed di sini; finalisasi setelah konversi Credit.
         
         # Normalisasi Customer JIKA ADA (untuk FORMAT 2)
         elif 'Customer' in df.columns and format_type == 'FORMAT_2':
@@ -1845,8 +2001,9 @@ def classify_bank_row(bank_row, df_aging, invoice_index):
     # ==============================================
     is_um = desc_upper.strip().startswith('UM')
     
-    # Ekstrak invoice dari COMMANDS
-    invoice_candidates = extract_invoice_numbers(description)
+    # Ekstrak invoice dari COMMANDS (FORMAT_6 tidak punya invoice -> lewati)
+    _is_f6_row = ('State' in bank_row and 'Receipt Method' in bank_row)
+    invoice_candidates = [] if _is_f6_row else extract_invoice_numbers(description)
     
     # Cek apakah ada referensi invoice di teks UM
     um_has_invoice = False
@@ -2059,12 +2216,8 @@ def classify_bank_row(bank_row, df_aging, invoice_index):
 # ==============================================
 # B4: MATCHING UM BELUM DI-APPLY (FORMAT_5)
 # ==============================================
-def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name_mode='otomatis'):
+def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name_mode='otomatis', allow_invoice_first=True, system_name=False):
     results = []
-    aging_by_customer = {}
-    for _, r in df_aging.iterrows():
-        aging_by_customer.setdefault(str(r['Customer']), []).append(r)
-    # index nominal persis global utk UNRELIABLE
     from collections import defaultdict
     exact_map = defaultdict(list)
     for idx, r in df_aging.iterrows():
@@ -2078,8 +2231,8 @@ def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name
         b = brow.to_dict()
         nominal = float(b.get('Nominal Dipakai', 0) or b.get('Credit', 0) or 0)
         desc = str(b.get('Description', ''))
-        # jika teks UM memuat invoice -> jalur invoice-first
-        invs = [i for i in extract_invoice_numbers(desc, 'FORMAT_5') if 'KWT' not in i]
+        # jika teks UM memuat invoice -> jalur invoice-first (dinonaktifkan untuk FORMAT_6)
+        invs = [i for i in extract_invoice_numbers(desc, 'FORMAT_5') if 'KWT' not in i] if allow_invoice_first else []
         invs_in_aging = [i for i in invs if clean_invisible_chars(i) in invoice_index]
         if invs_in_aging:
             inv = invs_in_aging[0]
@@ -2092,13 +2245,12 @@ def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name
                 results.append({**b, 'No Invoice': ar['No Invoice'], 'Customer': ar['Customer'], 'Saldo Piutang': ar['SALDO PIUTANG'], 'score': 95 if conf=='HIGH' else 75, 'confidence': conf, 'match_type': 'UM_INVOICE_REF', 'reasons': f"UM memuat invoice {inv}: {dexp}", 'is_combination': False, 'matched_invoice_count': 1, 'customer_similarity': 100, 'amount_diff': diff, 'amount_diff_pct': diff/nominal if nominal else 1, 'Dukungan Nama': 100, 'Sinyal': 'A', 'kandidat_alternatif': ''})
                 matched_invoice_ids.add(aidx)
                 continue
-        gate = apply_name_reliability_gate(b.get('Customer', ''), mode=name_mode)
+        gate = {'nama_terpakai': str(b.get('Customer','')).strip().upper(), 'kategori': 'FULL'} if system_name else apply_name_reliability_gate(b.get('Customer', ''), mode=name_mode)
         nama_pakai = gate['nama_terpakai']
         kat = gate['kategori']
         reliable = kat in ('PERUSAHAAN','ALIAS','FULL')
         weak = (not reliable) and bool(nama_pakai)
         unreliable = not nama_pakai or kat in ('GENERIK','TIDAK DIGUNAKAN')
-        # cari customer di aging
         locked = None
         dukung = 0
         if nama_pakai:
@@ -2132,7 +2284,6 @@ def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name
         if not locked:
             results.append({**b, 'No Invoice': '-', 'Customer': b.get('Customer','-'), 'Saldo Piutang': 0, 'score': 0, 'confidence': 'NONE', 'match_type': 'UNIDENTIFIED', 'reasons': 'Customer tidak ditemukan di aging (invoice mungkin belum terbit)', 'is_combination': False, 'matched_invoice_count': 0, 'customer_similarity': 0, 'amount_diff': 0, 'amount_diff_pct': 0, 'kandidat_alternatif': ''})
             continue
-        # kandidat dalam customer
         cand = df_aging[(df_aging['Customer'] == locked) & (~df_aging['aging_id'].isin(list(matched_invoice_ids)))].copy()
         exact = cand[abs(cand['SALDO PIUTANG'] - nominal) <= 1]
         if len(exact) == 1:
@@ -2146,7 +2297,6 @@ def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name
             alt = '; '.join([f"{r['No Invoice']} ({r['SALDO PIUTANG']:,.0f})" for _, r in exact.iterrows()])
             results.append({**b, 'No Invoice': '-', 'Customer': locked, 'Saldo Piutang': 0, 'score': 0, 'confidence': 'NONE', 'match_type': 'UNIDENTIFIED', 'reasons': 'Kandidat persis lebih dari satu; tidak dipilih', 'is_combination': False, 'matched_invoice_count': 0, 'customer_similarity': dukung, 'amount_diff': 0, 'amount_diff_pct': 0, 'kandidat_alternatif': alt})
             continue
-        # pola pajak
         best_tax = None
         for _, ar in cand.iterrows():
             dc, _, _, dexp = classify_amount_difference(float(ar['SALDO PIUTANG']), nominal)
@@ -2159,7 +2309,6 @@ def match_um_unapplied(df_um, df_aging, invoice_index, matched_invoice_ids, name
             results.append({**b, 'No Invoice': ar['No Invoice'], 'Customer': ar['Customer'], 'Saldo Piutang': ar['SALDO PIUTANG'], 'score': 75, 'confidence': conf, 'match_type': f"UM_{dc}", 'reasons': f"UM pola pajak ke {ar['No Invoice']}: {dexp}", 'is_combination': False, 'matched_invoice_count': 1, 'customer_similarity': dukung, 'amount_diff': abs(nominal-float(ar['SALDO PIUTANG'])), 'amount_diff_pct': abs(nominal-float(ar['SALDO PIUTANG']))/nominal if nominal else 1, 'kandidat_alternatif': ''})
             matched_invoice_ids.add(int(ar['aging_id']))
             continue
-        # kombinasi <=3 toleransi 0.5% + dukung>=80
         if dukung >= 80:
             recs = cand.to_dict('records')
             combo = find_subset_sum(recs, nominal, max_invoices=3, tolerance=0.005)
@@ -2190,9 +2339,19 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
     invoice_index = {str(row['No Invoice']): idx for idx, row in df_aging.iterrows()}
     fmt0 = df_bank.attrs.get('format_type', 'FORMAT_1')
     f5mode = df_bank.attrs.get('format5_mode', 'semua')
+    f6mode = df_bank.attrs.get('format6_mode', 'semua_kecuali_reversal')
+    if fmt0 == 'FORMAT_6':
+        um6 = df_bank.copy()
+        if 'Nominal Dipakai' not in um6.columns:
+            um6['Nominal Dipakai'] = um6.get('Credit', 0)
+        res6 = match_um_unapplied(um6, df_aging, invoice_index, set(), name_mode='system', allow_invoice_first=False, system_name=True)
+        import pandas as _pd6
+        df6 = _pd6.DataFrame(res6)
+        if not df6.empty:
+            df6.attrs['format_type'] = 'FORMAT_6'
+        return df6 if not df6.empty else _pd6.DataFrame(columns=['bank_id','Value Date','Reference No.','Description','Credit','Customer','No Invoice','Saldo Piutang','score','confidence','match_type','reasons','is_combination','matched_invoice_count','customer_similarity','amount_diff','amount_diff_pct'])
     if fmt0 == 'FORMAT_5' and f5mode == 'um_unapplied':
         um_rows = df_bank.copy()
-        # nominal pastikan ada
         if 'Nominal Dipakai' not in um_rows.columns:
             um_rows['Nominal Dipakai'] = um_rows.get('Credit', 0)
         res_um = match_um_unapplied(um_rows, df_aging, invoice_index, set())
@@ -2214,7 +2373,7 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
 
     for bank_idx, bank_row in df_bank.iterrows():
         bank_amount = bank_row['Credit']
-        invoice_candidates = extract_invoice_numbers(bank_row['Description'], format_type_global)
+        invoice_candidates = [] if format_type_global == 'FORMAT_6' else extract_invoice_numbers(bank_row['Description'], format_type_global)
 
         for inv_num in invoice_candidates:
             if inv_num in invoice_index and invoice_index[inv_num] not in matched_invoice_ids:
@@ -2335,7 +2494,7 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
         # ✅ ✅ ✅ FIX URUTAN PRIORITAS:
         # 1. Cek dulu apakah ada EXACT INVOICE di deskripsi (highest priority)
         bank_amount = bank_row['Credit']
-        invoice_candidates = extract_invoice_numbers(bank_row['Description'], format_type)
+        invoice_candidates = [] if format_type == 'FORMAT_6' else extract_invoice_numbers(bank_row['Description'], format_type)
 
         for inv_num in invoice_candidates:
             if inv_num in invoice_index and invoice_index[inv_num] not in matched_invoice_ids:
@@ -2757,7 +2916,7 @@ def generate_excel_output(df_result):
 
     # Kolom urutan yang diminta
     display_columns = [
-        'Value Date', 'Reference No.', 'TYPE', 'Description', 'Credit', 'Nominal Dipakai', 'SISA UM Parsed', 'Customer',
+        'Value Date', 'Reference No.', 'TYPE', 'Description', 'Credit', 'Nominal Dipakai', 'SISA UM Parsed', 'State', 'Status', 'Receipt Method', 'Unapplied Amount', 'Unidentified Amount', 'Customer',
         'No Invoice', 'SISA UM (Rp)', 'ADJUST UM (Rp)', 'APPLY',
         'Kategori', 'Dukungan Nama', 'Sinyal', 'kandidat_alternatif',
         'confidence', 'match_type', 'reasons',
@@ -2985,7 +3144,25 @@ def generate_excel_output(df_result):
             _exc = int(__import__('streamlit').session_state.get('format5_excluded', 0))
         except Exception:
             _exc = 0
-        summary_df['Dikecualikan (mode)'] = [0]*(len(summary_df)-1) + [_exc]
+        try:
+            _f6d = str(__import__('streamlit').session_state.get('format6_detail', ''))
+        except Exception:
+            _f6d = ''
+        try:
+            _f6e = int(__import__('streamlit').session_state.get('format6_excluded', 0))
+        except Exception:
+            _f6e = 0
+        try:
+            _f6i = int(__import__('streamlit').session_state.get('format6_included', 0))
+        except Exception:
+            _f6i = 0
+        if _f6d:
+            _exc = _f6e
+            summary_df['Dikecualikan (mode)'] = [0]*(len(summary_df)-1) + [_exc]
+            summary_df['Disertakan (mode)'] = [0]*(len(summary_df)-1) + [_f6i]
+            summary_df['Rincian FORMAT_6'] = ['']*(len(summary_df)-1) + [_f6d]
+        else:
+            summary_df['Dikecualikan (mode)'] = [0]*(len(summary_df)-1) + [_exc]
         summary_df.to_excel(writer, sheet_name='RINGKASAN', index=False)
         format_sheet(writer.sheets['RINGKASAN'], summary_df, has_confidence_color=False)
 
@@ -3058,6 +3235,12 @@ def main():
             st.subheader("\U0001F4CC Mode Baris FORMAT_5")
             format5_mode = st.radio("Pilih baris yang diproses:", options=['um_unapplied','pelunasan','semua'], format_func=lambda x: {'um_unapplied': '\U0001F4CC UM belum di-apply (default)', 'pelunasan': 'Pelunasan (PELNS)', 'semua': 'Semua baris debet'}.get(x,x), index=['um_unapplied','pelunasan','semua'].index(format5_mode))
             st.session_state['format5_mode'] = format5_mode
+        _f6det = st.session_state.get('detected_format_type', None)
+        format6_mode = st.session_state.get('format6_mode', 'semua_kecuali_reversal')
+        if _f6det == 'FORMAT_6':
+            st.subheader("\U0001F9FE Mode Baris FORMAT_6")
+            format6_mode = st.radio("Pilih baris yang diproses:", options=['belum','semua_kecuali_reversal'], format_func=lambda x: {'belum': '\U0001F4CC Belum di-apply', 'semua_kecuali_reversal': 'Semua kecuali reversal (default)'}.get(x,x), index=['belum','semua_kecuali_reversal'].index(format6_mode))
+            st.session_state['format6_mode'] = format6_mode
         st.markdown("---")
         st.caption("Daftar nama generik, alias, dan ambang kemiripan dikelola via config.py dan aliases.csv")
         st.caption("© Divisi KAK 2026")
@@ -3084,6 +3267,8 @@ def main():
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
         st.session_state.last_bank_file_hash = file_hash
+        # Deteksi format cepat agar radio mode tampil sebelum Start
+        st.session_state['detected_format_type'] = detect_format_fast(bank_file)
     
     if aging_file:
         file_hash = f"{aging_file.name}_{aging_file.size}"
@@ -3098,9 +3283,11 @@ def main():
             
             _saved_per = st.session_state.get('saved_periode', None)
             _saved_mode = st.session_state.get('saved_mode', None)
+            _saved_mode6 = st.session_state.get('saved_mode6', None)
             _cur_per2 = (periode_from, periode_to)
             _cur_mode2 = st.session_state.get('format5_mode', 'um_unapplied')
-            if 'df_result' in st.session_state and (_saved_per != _cur_per2 or _saved_mode != _cur_mode2):
+            _cur_mode6 = st.session_state.get('format6_mode', 'semua_kecuali_reversal')
+            if 'df_result' in st.session_state and (_saved_per != _cur_per2 or _saved_mode != _cur_mode2 or _saved_mode6 != _cur_mode6):
                 del st.session_state['df_result']
             # Jika belum pernah dijalankan, jalankan proses matching
             if 'df_result' not in st.session_state:
@@ -3123,14 +3310,35 @@ def main():
                         assert len(df_bank) == len(df_inc)
                     else:
                         st.session_state['format5_excluded'] = 0
+                    if df_bank.attrs.get('format_type') == 'FORMAT_6':
+                        cur6 = st.session_state.get('format6_mode', 'semua_kecuali_reversal')
+                        df_bank.attrs['format6_mode'] = cur6
+                        df6_inc, df6_exc = filter_format6_mode(df_bank, cur6)
+                        _rev_n = int((df6_exc['Alasan Dikecualikan'] == 'reversal').sum()) if 'Alasan Dikecualikan' in df6_exc.columns else 0
+                        _applied_n = int((df6_exc['Alasan Dikecualikan'] == 'applied_nol').sum()) if 'Alasan Dikecualikan' in df6_exc.columns else 0
+                        _other_n = int(len(df6_exc) - _rev_n - _applied_n)
+                        st.info(f"\U0001F9FE Mode FORMAT_6 '{cur6}': {len(df6_inc)} disertakan, {len(df6_exc)} dikecualikan ({_applied_n} sudah di-apply, {_rev_n} reversal" + (f", {_other_n} lainnya" if _other_n else "") + ").")
+                        st.session_state['format6_detail'] = f"{len(df6_inc)} disertakan, {len(df6_exc)} dikecualikan ({_applied_n} sudah di-apply, {_rev_n} reversal" + (f", {_other_n} lainnya" if _other_n else "") + ")"
+                        st.session_state['format6_included'] = len(df6_inc)
+                        st.session_state['format6_excluded'] = len(df6_exc)
+                        st.session_state['format6_reversal'] = _rev_n
+                        df_bank = df6_inc
+                        assert len(df_bank) == len(df6_inc)
+                    else:
+                        st.session_state['format6_excluded'] = 0
+                        st.session_state['format6_reversal'] = 0
 
-                    # ✅ PERINGATAN: > 50% invoice di COMMANDS tidak ada di aging
-                    try:
+                    # ✅ PERINGATAN: > 50% invoice di COMMANDS tidak ada di aging (hanya FORMAT_5)
+                    _fmt_warn = df_bank.attrs.get('format_type', 'FORMAT_1')
+                    if _fmt_warn != 'FORMAT_5':
+                        pass
+                    else:
+                      try:
                         invoice_index_check = {str(row['No Invoice']): idx for idx, row in df_aging.iterrows()}
                         total_invoice_refs = 0
                         invoice_not_in_aging = 0
                         for _, row in df_bank.iterrows():
-                            invs = extract_invoice_numbers(row.get('Description', ''))
+                            invs = [] if df_bank.attrs.get('format_type') == 'FORMAT_6' else extract_invoice_numbers(row.get('Description', ''))
                             if invs:
                                 total_invoice_refs += len(invs)
                                 for inv in invs:
@@ -3138,7 +3346,7 @@ def main():
                                         invoice_not_in_aging += 1
                         if total_invoice_refs > 0 and (invoice_not_in_aging / total_invoice_refs) > 0.5:
                             st.warning("⚠️ Aging kemungkinan bukan snapshot sebelum periode bank ini. Gunakan aging awal periode.")
-                    except Exception:
+                      except Exception:
                         pass
 
                     # ✅ FILTER PERIODE (jika dipilih)
@@ -3182,6 +3390,7 @@ def main():
                     st.session_state.df_result = df_result
                     st.session_state['saved_periode'] = (periode_from, periode_to)
                     st.session_state['saved_mode'] = st.session_state.get('format5_mode', 'um_unapplied')
+                    st.session_state['saved_mode6'] = st.session_state.get('format6_mode', 'semua_kecuali_reversal')
                     st.session_state.last_bank_file = bank_file.name
                     st.session_state.last_aging_file = aging_file.name
 
